@@ -1,0 +1,14 @@
+CREATE DATABASE translator_local;
+CREATE USER translator_user WITH PASSWORD 'Panconmante123'; 
+ALTER DATABASE translator_local OWNER TO translator_user;
+
+\c translator_local
+ALTER SCHEMA public OWNER TO translator_user;
+GRANT ALL ON SCHEMA public TO translator_user;
+GRANT ALL PRIVILEGES ON DATABASE translator_local TO translator_user;
+\q
+Super usuario django
+user: userhugp
+pass: Panconmante123
+
+.\.venv\Scripts\Activate.ps1
