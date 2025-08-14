@@ -1,0 +1,125 @@
+name: Deploy frontend pipeline
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Variant language for deployment'
+        required: true
+        type: choice
+        options:
+          - rap
+          - arn
+      requires_auth:
+        description: 'Translation requires authentication'
+        required: true
+        type: boolean
+        default: false
+      max_words_translation:
+        description: 'Max words translation'
+        required: true
+        type: number
+        default: 150
+jobs:
+  build-push-gcp:
+    name: Build and Push to GCP
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref == 'refs/heads/main' && 'PRODUCTION' || 'STAGING' }}
+
+    env:
+        PROJECT_ID: ${{ secrets.PROJECT_ID }}
+        SERVICE_REGION: ${{ vars.SERVICE_REGION }}
+        REGION: ${{ vars.ARTIFACT_REGION }}
+        REP_NAME: native-translator
+        IMAGE_NAME: ${{ vars.IMAGE_NAME_FRONTEND }}
+        VPC_NAME: ${{ vars.VPC_NAME }}
+        SUBNET_NAME: ${{ vars.FRONTEND_SUBNET }}
+        SERVICE_NAME_BACKEND: ${{ vars.SERVICE_NAME_BACKEND }}
+        MAX_WORDS_TRANSLATION: ${{ github.event.inputs.max_words_translation }}
+    steps:
+      - name: Set environment
+        id: set-environment
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "environment=PRODUCTION" >> $GITHUB_OUTPUT
+          else
+            echo "environment=STAGING" >> $GITHUB_OUTPUT
+          fi
+      - name: Set variant from dispatch event or branch
+        id: set-variant
+        run: |
+          if [ ! -z "${{ github.event.inputs.variant }}" ]; then
+            echo "variant=${{ github.event.inputs.variant }}" >> $GITHUB_OUTPUT
+          else
+            # Extract variant from branch name (e.g., main-rap -> rap)
+            echo "variant=$(echo $BRANCH | rev | cut -d'-' -f1 | rev)" >> $GITHUB_OUTPUT
+          fi
+      - name: Set GA Measurement ID based on variant
+        id: set-ga-id
+        run: |
+          if [ "${{ steps.set-variant.outputs.variant }}" = "rap"  && "${{ steps.set-environment.outputs.environment }}" = "PRODUCTION" ]; then
+            echo "ga_id=${{ secrets.GA_MEASUREMENT_ID_RAP }}" >> $GITHUB_OUTPUT
+          elif [ "${{ steps.set-variant.outputs.variant }}" = "arn" && "${{ steps.set-environment.outputs.environment }}" = "PRODUCTION" ]; then
+            echo "ga_id=${{ secrets.GA_MEASUREMENT_ID_ARN }}" >> $GITHUB_OUTPUT
+          fi
+      - name: Check out code
+        uses: actions/checkout@v3
+      - id: 'auth'
+        name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v0.4.0'
+        with:
+          credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
+      - name: Set up Cloud SDK
+        uses: 'google-github-actions/setup-gcloud@v2'
+        with:
+          version: '>= 416.0.0'
+      - name: 'Create production env file'
+        working-directory: Frontend/translator/
+        run: |-
+          echo "NEXT_PUBLIC_VARIANT=${{ steps.set-variant.outputs.variant }}" >> .env.production
+          echo "NEXT_PUBLIC_GA_MEASUREMENT_ID=${{ steps.set-ga-id.outputs.ga_id }}" >> .env.production
+          echo "NEXT_PUBLIC_MAX_WORDS_TRANSLATION=${{ env.MAX_WORDS_TRANSLATION }}" >> .env.production
+          # Set translation restriction based on environment
+          echo "NEXT_PUBLIC_TRANSLATION_REQUIRES_AUTH=${{ github.event.inputs.requires_auth }}" >> .env.production
+
+          # if not production, set the api url to the backend url so we dont use relative path
+          if [ "${{ steps.set-environment.outputs.environment }}" != "PRODUCTION" ]; then
+            SERVICE_NAME_BACKEND=${{ vars.SERVICE_NAME_BACKEND }}-${{ steps.set-variant.outputs.variant }}
+            echo "SERVICE_NAME_BACKEND: ${SERVICE_NAME_BACKEND}"
+            BACKEND_URL=$(gcloud run services describe $SERVICE_NAME_BACKEND --platform managed --region ${{ env.SERVICE_REGION }} --format 'value(status.url)')
+            echo "BACKEND_URL: ${BACKEND_URL}"
+            echo "NEXT_PUBLIC_API_URL=${BACKEND_URL}" >> .env.production
+          else
+            if [ "${{ steps.set-variant.outputs.variant }}" = "rap" ]; then
+              echo "BACKEND_URL: ${{ vars.URL_RAP }}"
+              echo "NEXT_PUBLIC_API_URL=${{ vars.URL_RAP }}" >> .env.production
+            elif [ "${{ steps.set-variant.outputs.variant }}" = "arn" ]; then
+              echo "BACKEND_URL: ${{ vars.URL_ARN }}"
+              echo "NEXT_PUBLIC_API_URL=${{ vars.URL_ARN }}" >> .env.production
+            fi
+          fi
+      - name: Build Docker Image
+        working-directory: Frontend/translator/
+        run: docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+
+      - name: Configure Docker Client # aunthenticate to rep
+        run: |-
+          gcloud auth configure-docker --quiet
+          gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Push Docker Image to Artifact Registry
+        run: |-
+          ARTIFACT_REGISTRY_URL=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REP_NAME }}/${{ steps.set-variant.outputs.variant }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          echo "Artifact Registry URL: $ARTIFACT_REGISTRY_URL"
+          echo "ARTIFACT_REGISTRY_URL=$ARTIFACT_REGISTRY_URL" >> $GITHUB_ENV
+          docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} $ARTIFACT_REGISTRY_URL
+          docker push $ARTIFACT_REGISTRY_URL
+
+      - name: Deploy to cloud run
+        uses: 'google-github-actions/deploy-cloudrun@v2'
+        with:
+          service: '${{ vars.SERVICE_NAME_FRONTEND }}-${{ steps.set-variant.outputs.variant }}'
+          image: ${{ env.ARTIFACT_REGISTRY_URL }}
+          region: '${{ env.SERVICE_REGION }}'
+          project_id: '${{ env.PROJECT_ID }}'
+          timeout: '5m'
+          flags: '--network=${{ env.VPC_NAME }} --subnet=${{ env.SUBNET_NAME }} --vpc-egress=all-traffic --max-instances=10 --concurrency=80'
